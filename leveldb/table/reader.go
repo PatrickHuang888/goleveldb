@@ -53,6 +53,7 @@ func max(x, y int) int {
 	return y
 }
 
+// restart point就是不共享prefix-key的开始
 type block struct {
 	bpool          *util.BufferPool
 	bh             blockHandle
@@ -62,10 +63,11 @@ type block struct {
 }
 
 func (b *block) seek(cmp comparer.Comparer, rstart, rlimit int, key []byte) (index, offset int, err error) {
+	// b.restartsLen-rstart-(b.restartsLen-rlimit)
 	index = sort.Search(b.restartsLen-rstart-(b.restartsLen-rlimit), func(i int) bool {
 		offset := int(binary.LittleEndian.Uint32(b.data[b.restartsOffset+4*(rstart+i):]))
 		offset++                                    // shared always zero, since this is a restart point
-		v1, n1 := binary.Uvarint(b.data[offset:])   // key length
+		v1, n1 := binary.Uvarint(b.data[offset:])   // key length, uint64
 		_, n2 := binary.Uvarint(b.data[offset+n1:]) // value length
 		m := offset + n1 + n2
 		return cmp.Compare(b.data[m:m+int(v1)], key) > 0
@@ -88,6 +90,7 @@ func (b *block) restartOffset(index int) int {
 	return int(binary.LittleEndian.Uint32(b.data[b.restartsOffset+4*index:]))
 }
 
+// 返回n是全部数据的长度
 func (b *block) entry(offset int) (key, value []byte, nShared, n int, err error) {
 	if offset >= b.restartsOffset {
 		if offset != b.restartsOffset {
@@ -95,18 +98,18 @@ func (b *block) entry(offset int) (key, value []byte, nShared, n int, err error)
 		}
 		return
 	}
-	v0, n0 := binary.Uvarint(b.data[offset:])       // Shared prefix length
-	v1, n1 := binary.Uvarint(b.data[offset+n0:])    // Key length
-	v2, n2 := binary.Uvarint(b.data[offset+n0+n1:]) // Value length
+	v0, n0 := binary.Uvarint(b.data[offset:])       // 第1个可变的64位整数是Shared prefix length
+	v1, n1 := binary.Uvarint(b.data[offset+n0:])    // Key length 第2个可变64位整数
+	v2, n2 := binary.Uvarint(b.data[offset+n0+n1:]) // Value length 第3个可变64位整数
 	m := n0 + n1 + n2
-	n = m + int(v1) + int(v2)
+	n = m + int(v1) + int(v2)  // 长度转成普通整数
 	if n0 <= 0 || n1 <= 0 || n2 <= 0 || offset+n > b.restartsOffset {
 		err = &ErrCorrupted{Reason: "entries corrupted"}
 		return
 	}
-	key = b.data[offset+m : offset+m+int(v1)]
-	value = b.data[offset+m+int(v1) : offset+n]
-	nShared = int(v0)
+	key = b.data[offset+m : offset+m+int(v1)]  // 获取key值
+	value = b.data[offset+m+int(v1) : offset+n] // 获取value
+	nShared = int(v0)  // 共享prefix的长度
 	return
 }
 
@@ -120,8 +123,8 @@ type dir int
 
 const (
 	dirReleased dir = iota - 1
-	dirSOI
-	dirEOI
+	dirSOI  // start of iterator?
+	dirEOI  // end of iterator ?
 	dirBackward
 	dirForward
 )
@@ -255,24 +258,24 @@ func (i *blockIter) Next() bool {
 		return false
 	}
 
-	if i.dir == dirSOI {
+	if i.dir == dirSOI {  // start of iterator?
 		i.restartIndex = i.riStart
 		i.offset = i.offsetStart
 	} else if i.dir == dirBackward {
 		i.prevNode = i.prevNode[:0]
 		i.prevKeys = i.prevKeys[:0]
 	}
-	for i.offset < i.offsetRealStart {
+	for i.offset < i.offsetRealStart {  // 一直到realstart?
 		key, value, nShared, n, err := i.block.entry(i.offset)
 		if err != nil {
 			i.sErr(i.tr.fixErrCorruptedBH(i.block.bh, err))
 			return false
 		}
-		if n == 0 {
-			i.dir = dirEOI
+		if n == 0 {  // 读完了?
+			i.dir = dirEOI  // end of iterator?
 			return false
 		}
-		i.key = append(i.key[:nShared], key...)
+		i.key = append(i.key[:nShared], key...)  // 加到共享后面
 		i.value = value
 		i.offset += n
 	}
@@ -296,7 +299,7 @@ func (i *blockIter) Next() bool {
 	i.value = value
 	i.prevOffset = i.offset
 	i.offset += n
-	i.dir = dirForward
+	i.dir = dirForward  // 向前
 	return true
 }
 
@@ -311,7 +314,7 @@ func (i *blockIter) Prev() bool {
 	var ri int
 	if i.dir == dirForward {
 		// Change direction.
-		i.offset = i.prevOffset
+		i.offset = i.prevOffset  // offset 等于前一个block的
 		if i.offset == i.offsetRealStart {
 			i.dir = dirSOI
 			return false
@@ -560,22 +563,22 @@ func (r *Reader) fixErrCorruptedBH(bh blockHandle, err error) error {
 }
 
 func (r *Reader) readRawBlock(bh blockHandle, verifyChecksum bool) ([]byte, error) {
-	data := r.bpool.Get(int(bh.length + blockTrailerLen))
+	data := r.bpool.Get(int(bh.length + blockTrailerLen))  // block trailer 5字节
 	if _, err := r.reader.ReadAt(data, int64(bh.offset)); err != nil && err != io.EOF {
 		return nil, err
 	}
 
 	if verifyChecksum {
 		n := bh.length + 1
-		checksum0 := binary.LittleEndian.Uint32(data[n:])
+		checksum0 := binary.LittleEndian.Uint32(data[n:]) // block后面4个字节是checksum
 		checksum1 := util.NewCRC(data[:n]).Value()
-		if checksum0 != checksum1 {
+		if checksum0 != checksum1 {  // 校验
 			r.bpool.Put(data)
 			return nil, r.newErrCorruptedBH(bh, fmt.Sprintf("checksum mismatch, want=%#x got=%#x", checksum0, checksum1))
 		}
 	}
 
-	switch data[bh.length] {
+	switch data[bh.length] {  // block最后一个字节:是否压缩
 	case blockTypeNoCompression:
 		data = data[:bh.length]
 	case blockTypeSnappyCompression:
@@ -604,7 +607,7 @@ func (r *Reader) readBlock(bh blockHandle, verifyChecksum bool) (*block, error) 
 	if err != nil {
 		return nil, err
 	}
-	restartsLen := int(binary.LittleEndian.Uint32(data[len(data)-4:]))
+	restartsLen := int(binary.LittleEndian.Uint32(data[len(data)-4:])) // block最后4个字节(32位int)指出restart长度
 	b := &block{
 		bpool:          r.bpool,
 		bh:             bh,
@@ -1039,10 +1042,12 @@ func NewReader(f io.ReaderAt, size int64, fd storage.FileDesc, cache *cache.Name
 	}
 
 	footerPos := size - footerLen
-	var footer [footerLen]byte
+	var footer [footerLen]byte  // footer 48字节
+	// no start end means 0:len(slice), but why not just footer?
 	if _, err := r.reader.ReadAt(footer[:], footerPos); err != nil && err != io.EOF {
 		return nil, err
 	}
+	// 校验尾巴上的magic
 	if string(footer[footerLen-len(magic):footerLen]) != magic {
 		r.err = r.newErrCorrupted(footerPos, footerLen, "table-footer", "bad magic number")
 		return r, nil
@@ -1050,14 +1055,14 @@ func NewReader(f io.ReaderAt, size int64, fd storage.FileDesc, cache *cache.Name
 
 	var n int
 	// Decode the metaindex block handle.
-	r.metaBH, n = decodeBlockHandle(footer[:])
+	r.metaBH, n = decodeBlockHandle(footer[:]) // 最前面是metaBlockHandle, 解出offset和length
 	if n == 0 {
 		r.err = r.newErrCorrupted(footerPos, footerLen, "table-footer", "bad metaindex block handle")
 		return r, nil
 	}
 
 	// Decode the index block handle.
-	r.indexBH, n = decodeBlockHandle(footer[n:])
+	r.indexBH, n = decodeBlockHandle(footer[n:])  // 然后是indexBlockHandle
 	if n == 0 {
 		r.err = r.newErrCorrupted(footerPos, footerLen, "table-footer", "bad index block handle")
 		return r, nil
